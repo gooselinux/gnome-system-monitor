@@ -1,0 +1,12 @@
+diff -up gnome-system-monitor-2.28.0/help/gnome-system-monitor.omf.in.doc-category gnome-system-monitor-2.28.0/help/gnome-system-monitor.omf.in
+--- gnome-system-monitor-2.28.0/help/gnome-system-monitor.omf.in.doc-category	2010-05-03 19:44:05.372184687 -0400
++++ gnome-system-monitor-2.28.0/help/gnome-system-monitor.omf.in	2010-05-03 19:44:15.283182942 -0400
+@@ -1,7 +1,7 @@
+ <?xml version="1.0" standalone="no"?>
+ <omf>
+   <resource>
+-    <subject category="GNOME|Applications|System Tools"/>
++    <subject category="GNOME|System"/>
+     <type>manual</type>
+     <relation seriesid="0beef4ba-5ca4-11d6-9d4d-e07a2388f7ea"/>
+     <rights type="GNU FDL" license.version="1.1" holder="Bill Day and Sun Microsystems"/>

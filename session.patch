@@ -1,0 +1,934 @@
+diff -up /dev/null gnome-system-monitor-2.23.6/src/gsm-session-manager.c
+--- /dev/null	2008-08-13 11:36:43.974262811 -0400
++++ gnome-system-monitor-2.23.6/src/gsm-session-manager.c	2008-08-13 17:23:15.000000000 -0400
+@@ -0,0 +1,528 @@
++/* gsm-session-manager.h - functions for monitoring the session
++ *
++ * Copyright (C) 2008 Red Hat, Inc
++ * Author: Matthias Clasen
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2, or (at your option)
++ * any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
++ * 02111-1307, USA.  
++ */
++
++#include <dbus/dbus-glib.h>
++#include <gsm-session-manager.h>
++#include <string.h>
++
++struct _GsmSessionManagerPrivate
++{
++	DBusGConnection  *dbus_connection;
++        DBusGProxy       *bus_proxy;
++        DBusGProxy       *sm_proxy;
++	guint		  is_connected :1;
++
++	GHashTable	 *clients;
++};
++
++static void gsm_session_manager_finalize                 (GObject *object);
++static void gsm_session_manager_class_install_signals    (GsmSessionManagerClass *manager_class);
++
++static void gsm_session_manager_class_install_properties (GsmSessionManagerClass *manager_class);
++
++static void gsm_session_manager_get_property (GObject    *object,
++                                              guint       prop_id,
++                                              GValue     *value,
++                                              GParamSpec *pspec);
++
++static gboolean ensure_connection            (GsmSessionManager  *manager,
++                                              GError            **error);
++static void     get_all_clients              (GsmSessionManager *manager);
++
++enum {
++        PROP_0 = 0,
++        PROP_IS_CONNECTED
++};
++
++enum {
++	CLIENT_ADDED = 0,
++	CLIENT_REMOVED,
++	LAST_SIGNAL
++};
++
++static guint signals[LAST_SIGNAL];
++
++G_DEFINE_TYPE (GsmSessionManager, gsm_session_manager, G_TYPE_OBJECT);
++
++static void
++gsm_session_manager_class_init (GsmSessionManagerClass *manager_class)
++{
++	GObjectClass *object_class;
++
++	object_class = G_OBJECT_CLASS (manager_class);
++
++	object_class->finalize = gsm_session_manager_finalize;
++
++        gsm_session_manager_class_install_properties (manager_class);
++        gsm_session_manager_class_install_signals (manager_class);
++
++	g_type_class_add_private (manager_class,
++				  sizeof (GsmSessionManagerPrivate));
++}
++
++static void
++gsm_session_manager_class_install_signals (GsmSessionManagerClass *manager_class)
++{
++        GObjectClass *object_class;
++
++        object_class = G_OBJECT_CLASS (manager_class);
++
++	signals[CLIENT_ADDED] =
++		g_signal_new ("client-added",
++			      G_OBJECT_CLASS_TYPE (object_class),
++			      G_SIGNAL_RUN_LAST,
++			      G_STRUCT_OFFSET (GsmSessionManagerClass, client_added),
++			      NULL, NULL,
++			      g_cclosure_marshal_VOID__STRING,
++			      G_TYPE_NONE, 1, G_TYPE_STRING);
++	signals[CLIENT_REMOVED] =
++		g_signal_new ("client-removed",
++			      G_OBJECT_CLASS_TYPE (object_class),
++			      G_SIGNAL_RUN_LAST,
++			      G_STRUCT_OFFSET (GsmSessionManagerClass, client_removed),
++			      NULL, NULL,
++			      g_cclosure_marshal_VOID__STRING,
++			      G_TYPE_NONE, 1, G_TYPE_STRING);
++}
++
++static void
++gsm_session_manager_class_install_properties (GsmSessionManagerClass *manager_class)
++{
++        GObjectClass *object_class;
++        GParamSpec   *param_spec;
++
++        object_class = G_OBJECT_CLASS (manager_class);
++        object_class->get_property = gsm_session_manager_get_property;
++
++        param_spec = g_param_spec_boolean ("is-connected",
++                                           "Is connected",
++                                           "Whether we are connected to "
++                                           "the session manager",
++                                           FALSE,
++                                           G_PARAM_READABLE);
++
++        g_object_class_install_property (object_class, PROP_IS_CONNECTED,
++                                         param_spec);
++}
++
++static void
++on_name_owner_changed (DBusGProxy        *bus_proxy,
++                       const char        *name,
++                       const char        *prev_owner,
++                       const char        *new_owner,
++                       GsmSessionManager *manager)
++{
++        if (strcmp (name, "org.gnome.SessionManager") != 0) {
++                return;
++        }
++
++        if (manager->priv->sm_proxy != NULL) {
++                g_object_unref (manager->priv->sm_proxy);
++                manager->priv->sm_proxy = NULL;
++        }
++
++	g_hash_table_remove_all (manager->priv->clients);
++
++        if (ensure_connection (manager, NULL))
++		get_all_clients (manager);
++}
++
++
++static void
++get_client_details (GsmSessionManager        *manager,
++		    const char               *obj_path,
++                    GsmClientDetailsCallback  callback,
++                    gpointer                  data)
++{
++        DBusGProxy *proxy;
++        GError *error = NULL;
++        gboolean ret;
++        guint status;
++        guint restart_style_hint;
++        guint pid;
++
++        proxy = dbus_g_proxy_new_for_name (manager->priv->dbus_connection,
++                                           "org.gnome.SessionManager",
++                                           obj_path,
++                                           "org.gnome.SessionManager.Client");
++
++        ret = dbus_g_proxy_call (proxy, "GetUnixProcessId", &error,
++                                 G_TYPE_INVALID,
++                                 G_TYPE_UINT, &pid,
++                                 G_TYPE_INVALID);
++        if (error) {
++                g_warning ("ERROR: %s\n", error->message);
++                g_error_free (error);
++                goto cleanup;
++        }
++        if (!ret) {
++                g_warning ("GetUnixProcessId failed\n");
++                goto cleanup;
++        }
++
++        ret = dbus_g_proxy_call (proxy, "GetStatus", &error,
++                                 G_TYPE_INVALID,
++                                 G_TYPE_UINT, &status,
++                                 G_TYPE_INVALID);
++        if (error) {
++                g_warning ("ERROR: %s\n", error->message);
++                g_error_free (error);
++                goto cleanup;
++        }
++        if (!ret) {
++                g_warning ("GetStatus failed\n");
++                goto cleanup;
++        }
++
++        ret = dbus_g_proxy_call (proxy, "GetRestartStyleHint", &error,
++                                 G_TYPE_INVALID,
++                                 G_TYPE_UINT, &restart_style_hint,
++                                 G_TYPE_INVALID);
++        if (error) {
++                g_warning ("ERROR: %s\n", error->message);
++                g_error_free (error);
++                goto cleanup;
++        }
++        if (!ret) {
++                g_warning ("GetRestartStyleHint failed\n");
++                goto cleanup;
++        }
++
++        callback (obj_path, pid, status, restart_style_hint, data);
++
++cleanup:
++        g_object_unref (proxy);
++}
++
++
++typedef struct {
++	guint       pid;
++	guint	    status;
++	guint       restart_style_hint;
++} ClientDetails;
++
++void
++gsm_session_manager_foreach (GsmSessionManager        *manager,
++                             GsmClientDetailsCallback  callback,
++                             gpointer                  data)
++{
++	GHashTableIter iter;
++	gchar *key;
++	ClientDetails *value;
++
++	g_hash_table_iter_init (&iter, manager->priv->clients);
++	while (g_hash_table_iter_next (&iter,(gpointer *)&key, (gpointer *)&value)) {
++		callback (key, value->pid, value->status, value->restart_style_hint, data);
++	}
++}
++
++static void
++add_client (const char        *obj_path,
++	    guint              pid,
++            guint              status,
++            guint              restart_style_hint,
++	    gpointer           data)
++{
++	GsmSessionManager *manager = data;
++
++	ClientDetails *details;
++
++	details = g_new (ClientDetails, 1);
++	details->pid = pid;
++	details->status = status;
++	details->restart_style_hint = restart_style_hint;
++
++	g_hash_table_insert (manager->priv->clients, 
++			     g_strdup (obj_path),
++			     details);	
++}
++
++static void
++get_all_clients (GsmSessionManager *manager)
++{
++        GError *error = NULL;
++        GPtrArray *array;
++        gboolean ret;
++        gchar *obj_path;
++        guint i;
++
++        ret = dbus_g_proxy_call (manager->priv->sm_proxy, 
++				 "GetClients", &error,
++                                 G_TYPE_INVALID,
++                                 dbus_g_type_get_collection ("GPtrArray", DBUS_TYPE_G_OBJECT_PATH), &array,
++                                 G_TYPE_INVALID);
++
++        if (error) {
++                g_warning ("ERROR: %s\n", error->message);
++                g_error_free (error);
++                return;
++        }
++        if (!ret) {
++                g_warning ("GetClients failed\n");
++        }
++
++        for (i = 0; i < array->len; i++) {
++                obj_path = g_ptr_array_index (array, i);
++                get_client_details (manager, obj_path, add_client, manager);
++        }
++
++        g_ptr_array_foreach (array, (GFunc)g_free, NULL);
++        g_ptr_array_free (array, TRUE);
++}
++
++
++
++static void
++on_client_added (DBusGProxy        *sm_proxy,
++		 const gchar       *obj_path,
++		 GsmSessionManager *manager)
++{
++        get_client_details (manager, obj_path, add_client, manager);
++
++	g_signal_emit (manager, signals[CLIENT_ADDED], 0, obj_path);
++}
++
++static void
++on_client_removed (DBusGProxy        *sm_proxy,
++                   const char        *obj_path,
++                   GsmSessionManager *manager)
++{
++	g_signal_emit (manager, signals[CLIENT_REMOVED], 0, obj_path);
++	
++	g_hash_table_remove (manager->priv->clients, obj_path);
++}
++
++static gboolean
++ensure_connection (GsmSessionManager  *manager,
++                   GError            **error)
++{
++        GError   *connection_error;
++        gboolean  is_connected;
++
++        connection_error = NULL;
++        if (manager->priv->dbus_connection == NULL) {
++                manager->priv->dbus_connection = dbus_g_bus_get (DBUS_BUS_SESSION,
++                                                                 &connection_error);
++
++                if (manager->priv->dbus_connection == NULL) {
++                        g_propagate_error (error, connection_error);
++                        is_connected = FALSE;
++                        goto out;
++                }
++        }
++        if (manager->priv->bus_proxy == NULL) {
++                manager->priv->bus_proxy =
++                        dbus_g_proxy_new_for_name_owner (manager->priv->dbus_connection,
++                                                         DBUS_SERVICE_DBUS,
++                                                         DBUS_PATH_DBUS,
++                                                         DBUS_INTERFACE_DBUS,
++                                                         &connection_error);
++
++                if (manager->priv->bus_proxy == NULL) {
++                        g_propagate_error (error, connection_error);
++                        is_connected = FALSE;
++                        goto out;
++                }
++
++                dbus_g_proxy_add_signal (manager->priv->bus_proxy,
++                                         "NameOwnerChanged",
++                                         G_TYPE_STRING,
++                                         G_TYPE_STRING,
++                                         G_TYPE_STRING,
++                                         G_TYPE_INVALID);
++                dbus_g_proxy_connect_signal (manager->priv->bus_proxy,
++                                             "NameOwnerChanged",
++                                             G_CALLBACK (on_name_owner_changed),
++                                             manager, NULL);
++        }
++
++        if (manager->priv->sm_proxy == NULL) {
++                manager->priv->sm_proxy =
++                        dbus_g_proxy_new_for_name_owner (manager->priv->dbus_connection,
++                                                         "org.gnome.SessionManager",
++                                                         "/org/gnome/SessionManager",
++                                                         "org.gnome.SessionManager",
++                                                         &connection_error);
++
++                if (manager->priv->sm_proxy == NULL) {
++                        g_propagate_error (error, connection_error);
++                        is_connected = FALSE;
++                        goto out;
++                }
++
++        	dbus_g_proxy_add_signal (manager->priv->sm_proxy, 
++					 "ClientAdded", 
++					 DBUS_TYPE_G_OBJECT_PATH, 
++					 G_TYPE_INVALID);
++		dbus_g_proxy_connect_signal (manager->priv->sm_proxy, 
++					     "ClientAdded", 
++					     G_CALLBACK (on_client_added), 
++					     manager, NULL);
++
++        	dbus_g_proxy_add_signal (manager->priv->sm_proxy, 
++					 "ClientRemoved", 
++					 DBUS_TYPE_G_OBJECT_PATH, 
++					 G_TYPE_INVALID);
++		dbus_g_proxy_connect_signal (manager->priv->sm_proxy, 
++					     "ClientRemoved", 
++					     G_CALLBACK (on_client_removed), 
++					     manager, NULL);
++        }
++
++        is_connected = TRUE;
++
++ out:
++        if (manager->priv->is_connected != is_connected) {
++                manager->priv->is_connected = is_connected;
++                g_object_notify (G_OBJECT (manager), "is-connected");
++        }
++
++        if (!is_connected) {
++                if (manager->priv->dbus_connection == NULL) {
++                        if (manager->priv->bus_proxy != NULL) {
++                                g_object_unref (manager->priv->bus_proxy);
++                                manager->priv->bus_proxy = NULL;
++                        }
++
++                        if (manager->priv->sm_proxy != NULL) {
++                                g_object_unref (manager->priv->sm_proxy);
++                                manager->priv->sm_proxy = NULL;
++                        }
++                } else if (manager->priv->bus_proxy == NULL) {
++                        if (manager->priv->sm_proxy != NULL) {
++                                g_object_unref (manager->priv->sm_proxy);
++                                manager->priv->sm_proxy = NULL;
++                        }
++                }
++        }
++
++        return is_connected;
++}
++
++
++static void
++gsm_session_manager_init (GsmSessionManager *manager)
++{
++	GError *error;
++
++	manager->priv = G_TYPE_INSTANCE_GET_PRIVATE (manager, GSM_TYPE_SESSION_MANAGER,
++		 				     GsmSessionManagerPrivate);
++
++	manager->priv->dbus_connection = NULL;
++	manager->priv->bus_proxy = NULL;
++	manager->priv->sm_proxy = NULL;
++	manager->priv->is_connected = FALSE;
++
++	manager->priv->clients = g_hash_table_new_full (g_str_hash, g_str_equal,
++							g_free, g_free);
++	error = NULL;
++
++        if (ensure_connection (manager, &error)) {
++		get_all_clients (manager);
++	}
++	else {
++                g_message ("Could not connect to session manager: %s",
++                           error->message);
++                g_error_free (error);
++        }
++}
++
++static void
++gsm_session_manager_finalize (GObject *object)
++{
++        GsmSessionManager *manager;
++        GObjectClass      *parent_class;
++
++        manager = GSM_SESSION_MANAGER (object);
++
++	g_hash_table_destroy (manager->priv->clients);
++
++        parent_class = G_OBJECT_CLASS (gsm_session_manager_parent_class);
++
++        if (parent_class->finalize != NULL) {
++                parent_class->finalize (object);
++        }
++}
++
++static void
++gsm_session_manager_get_property (GObject    *object,
++                                  guint       prop_id,
++                                  GValue     *value,
++                                  GParamSpec *pspec)
++{
++        GsmSessionManager *manager = GSM_SESSION_MANAGER (object);
++
++        switch (prop_id) {
++        case PROP_IS_CONNECTED:
++                g_value_set_boolean (value,
++                                     manager->priv->is_connected);
++                break;
++
++        default:
++                G_OBJECT_WARN_INVALID_PROPERTY_ID (object,
++                                                   prop_id,
++                                                   pspec);
++        }
++}
++
++GsmSessionManager *
++gsm_session_manager_new (void)
++{
++        GsmSessionManager *manager;
++
++        manager = g_object_new (GSM_TYPE_SESSION_MANAGER, NULL);
++
++        return manager;
++}
++
++GsmSessionManager *
++gsm_session_manager_get (void)
++{
++        static GsmSessionManager *manager = NULL;
++
++        if (manager == NULL) {
++                manager = gsm_session_manager_new ();
++        }
++
++        return g_object_ref (manager);
++}
++
++gboolean
++gsm_session_manager_get_details (GsmSessionManager *manager,
++				 const char        *obj_path,
++				 guint             *pid,
++				 guint 		   *status,
++				 guint		   *restart_style_hint)
++{
++	ClientDetails *details;
++
++	details = (ClientDetails *)g_hash_table_lookup (manager->priv->clients, obj_path);
++
++	if (details) {
++		*pid = details->pid;
++		*status = details->status;
++		*restart_style_hint = details->restart_style_hint;
++		return TRUE;
++	}
++	
++	return FALSE;
++}
++ 
+diff -up /dev/null gnome-system-monitor-2.23.6/src/gsm-session-manager.h
+--- /dev/null	2008-08-13 11:36:43.974262811 -0400
++++ gnome-system-monitor-2.23.6/src/gsm-session-manager.h	2008-08-13 17:23:15.000000000 -0400
+@@ -0,0 +1,76 @@
++/* gsm-session-manager.h - functions for monitoring the session
++ *
++ * Copyright (C) 2008 Red Hat, Inc
++ * Author: Matthias Clasen
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2, or (at your option)
++ * any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
++ * 02111-1307, USA.  
++ */
++#ifndef GSM_SESSION_MANAGER_H
++#define GSM_SESSION_MANAGER_H
++
++#include <glib-object.h>
++
++G_BEGIN_DECLS
++
++#define GSM_TYPE_SESSION_MANAGER		(gsm_session_manager_get_type ())
++#define GSM_SESSION_MANAGER(obj)		(G_TYPE_CHECK_INSTANCE_CAST ((obj), GSM_TYPE_SESSION_MANAGER, GsmSessionManager))
++#define GSM_SESSION_MANAGER_CLASS(klass)	(G_TYPE_CHECK_CLASS_CAST ((klass), GSM_TYPE_SESSION_MANAGER, GsmSessionManagerClass))
++#define GSM_IS_SESSION_MANAGER(obj)		(G_TYPE_CHECK_INSTANCE_TYPE ((obj), GSM_TYPE_SESSION_MANAGER))
++#define GSM_IS_SESSION_MANAGER_CLASS(klass)	(G_TYPE_CHECK_CLASS_TYPE ((klass), GSM_TYPE_SESSION_MANAGER))
++#define GSM_SESSION_MANAGER_GET_CLASS(obj)	(G_TYPE_INSTANCE_GET_CLASS((obj), GSM_TYPE_SESSION_MANAGER, GsmSessionManagerClass))
++
++typedef struct _GsmSessionManager		GsmSessionManager;
++typedef struct _GsmSessionManagerClass		GsmSessionManagerClass;
++typedef struct _GsmSessionManagerPrivate	GsmSessionManagerPrivate;
++
++struct _GsmSessionManager {
++	GObject parent_instance;
++
++	GsmSessionManagerPrivate *priv;
++};
++
++struct _GsmSessionManagerClass {
++	GObjectClass parent_class;
++
++	/* signals */
++	void (* client_added) (GsmSessionManager *manager, 
++			       const char        *obj_path);
++	void (*client_removed) (GsmSessionManager *manager,
++				const char        *obj_path);
++};
++
++typedef void (*GsmClientDetailsCallback) (const char *obj_path,
++                                          guint       pid,
++                                          guint       status,
++                                          guint       restart_style_hint,
++                                          gpointer    data);
++
++GType gsm_session_manager_get_type (void);
++
++GsmSessionManager *gsm_session_manager_new (void) G_GNUC_MALLOC;
++GsmSessionManager *gsm_session_manager_get (void);
++void               gsm_session_manager_foreach (GsmSessionManager        *manager,
++                                                GsmClientDetailsCallback  callbac,
++                                                gpointer                  data);
++gboolean	   gsm_session_manager_get_details (GsmSessionManager    *manager,
++						    const char           *obj_path,
++						    guint                *pid,
++						    guint		 *status,
++						    guint		 *restart_style);
++
++G_END_DECLS
++
++#endif /* GSM_SESSION_MANAGER_H */
+diff -up gnome-system-monitor-2.23.6/src/Makefile.am.session gnome-system-monitor-2.23.6/src/Makefile.am
+--- gnome-system-monitor-2.23.6/src/Makefile.am.session	2008-08-13 17:23:15.000000000 -0400
++++ gnome-system-monitor-2.23.6/src/Makefile.am	2008-08-13 17:24:35.000000000 -0400
+@@ -35,7 +35,8 @@ gnome_system_monitor_SOURCES = \
+ 	gconf-keys.cpp gconf-keys.h \
+ 	iconthemewrapper.cpp iconthemewrapper.h \
+ 	e_date.c e_date.h \
+-        gsm_color_button.c gsm_color_button.h
++        gsm_color_button.c gsm_color_button.h \
++	gsm-session-manager.c gsm-session-manager.h
+ 
+ if HAVE_POLKIT
+ gnome_system_monitor_SOURCES += gnome-system-monitor-mechanism-client-glue.h
+diff -up gnome-system-monitor-2.23.6/src/proctable.cpp.session gnome-system-monitor-2.23.6/src/proctable.cpp
+--- gnome-system-monitor-2.23.6/src/proctable.cpp.session	2008-05-31 14:38:57.000000000 -0400
++++ gnome-system-monitor-2.23.6/src/proctable.cpp	2008-08-13 17:23:15.000000000 -0400
+@@ -51,6 +51,7 @@
+ #include "util.h"
+ #include "interface.h"
+ #include "selinux.h"
++#include "gsm-session-manager.h"
+ 
+ 
+ ProcInfo::UserMap ProcInfo::users;
+@@ -225,6 +226,7 @@ proctable_new (ProcData * const procdata
+ 		N_("Memory"),
+ 		/* xgettext: wchan, see ps(1) or top(1) */
+ 		N_("Waiting Channel"),
++		N_("Session"),
+ 		NULL,
+ 		"POINTER"
+ 	};
+@@ -254,9 +256,12 @@ proctable_new (ProcData * const procdata
+ 				    G_TYPE_STRING,	/* Arguments	*/
+ 				    G_TYPE_ULONG,	/* Memory       */
+ 				    G_TYPE_STRING,	/* wchan	*/
++				    G_TYPE_UINT,        /* Session state */
++				    G_TYPE_UINT,        /* Restart style */
+ 				    GDK_TYPE_PIXBUF,	/* Icon		*/
+ 				    G_TYPE_POINTER,	/* ProcInfo	*/
+ 				    G_TYPE_STRING	/* Sexy tooltip */
++				    
+ 		);
+ 
+ 	proctree = gtk_tree_view_new_with_model (GTK_TREE_MODEL (model));
+@@ -295,7 +300,6 @@ proctable_new (ProcData * const procdata
+ 	gtk_tree_view_append_column (GTK_TREE_VIEW (proctree), column);
+ 	gtk_tree_view_set_expander_column (GTK_TREE_VIEW (proctree), column);
+ 
+-
+ 	for (i = COL_USER; i <= COL_WCHAN; i++) {
+ 
+ 		GtkCellRenderer *cell;
+@@ -385,6 +389,26 @@ proctable_new (ProcData * const procdata
+ 		}
+ 	}
+ 
++	column = gtk_tree_view_column_new();
++	gtk_tree_view_column_set_title(column, _(titles[COL_SESSION_STATE]));
++	gtk_tree_view_column_set_resizable(column, FALSE);
++	gtk_tree_view_column_set_reorderable(column, TRUE);
++	gtk_tree_view_column_set_sort_column_id (column, COL_SESSION_STATE);
++	gtk_tree_view_append_column(GTK_TREE_VIEW(proctree), column);
++	cell_renderer = gtk_cell_renderer_pixbuf_new ();
++	gtk_tree_view_column_pack_start (column, cell_renderer, FALSE);
++	gtk_tree_view_column_set_cell_data_func(column, cell_renderer,
++						&procman::session_state_cell_data_func,
++						GUINT_TO_POINTER(COL_SESSION_STATE),
++						NULL);
++
++	cell_renderer = gtk_cell_renderer_pixbuf_new ();
++	gtk_tree_view_column_pack_start (column, cell_renderer, FALSE);
++	gtk_tree_view_column_set_cell_data_func(column, cell_renderer,
++						&procman::restart_style_cell_data_func,
++						GUINT_TO_POINTER(COL_RESTART_STYLE),
++						NULL);
++
+ 	gtk_container_add (GTK_CONTAINER (scrolled), proctree);
+ 
+ 	procdata->tree = proctree;
+@@ -834,6 +858,59 @@ refresh_list (ProcData *procdata, const 
+ 		update_info_mutable_cols(it->second);
+ }
+ 
++static gboolean
++clear_session_data (GtkTreeModel *model,
++		    GtkTreePath  *path,
++		    GtkTreeIter  *iter,
++		    gpointer      data)
++{
++	gtk_tree_store_set (GTK_TREE_STORE (model),
++			    iter,
++			    COL_SESSION_STATE, 0,
++			    COL_RESTART_STYLE, 0,
++			    -1);
++	
++	return FALSE;
++}
++
++static void
++update_session_data (const char *obj_path, 
++		     guint       pid,
++		     guint       status,
++		     guint	 restart_style_hint,
++		     gpointer    data)
++{
++	GtkTreeModel *model = (GtkTreeModel*)data;
++	GtkTreeIter iter;
++	guint pid2;
++
++	gtk_tree_model_get_iter_first (model, &iter);
++	do {
++		gtk_tree_model_get (model, &iter, COL_PID, &pid2, -1);
++		if (pid == pid2) {
++			gtk_tree_store_set (GTK_TREE_STORE (model),
++					    &iter,
++					    COL_SESSION_STATE, status,
++					    COL_RESTART_STYLE, restart_style_hint + 1,
++					    -1);
++			return;
++		}
++	} while (gtk_tree_model_iter_next (model, &iter));
++}
++
++static void
++add_session_data (ProcData * const procdata)
++{
++	GsmSessionManager *manager;
++	GtkTreeModel *model;
++
++	model = gtk_tree_view_get_model (GTK_TREE_VIEW (procdata->tree));
++	gtk_tree_model_foreach (model, clear_session_data, NULL);
++
++	manager = gsm_session_manager_get ();
++	gsm_session_manager_foreach (manager, update_session_data, model);
++	g_object_unref (manager);
++}
+ 
+ void
+ proctable_update_list (ProcData * const procdata)
+@@ -880,6 +957,7 @@ proctable_update_list (ProcData * const 
+ 	procdata->cpu_total_time_last = cpu.total;
+ 
+ 	refresh_list (procdata, pid_list, proclist.number);
++ 	add_session_data (procdata);
+ 
+ 	selection.restore(procdata->tree);
+ 
+diff -up gnome-system-monitor-2.23.6/src/proctable.h.session gnome-system-monitor-2.23.6/src/proctable.h
+--- gnome-system-monitor-2.23.6/src/proctable.h.session	2008-05-24 17:58:27.000000000 -0400
++++ gnome-system-monitor-2.23.6/src/proctable.h	2008-08-13 17:23:15.000000000 -0400
+@@ -43,6 +43,8 @@ enum
+ 	COL_ARGS,
+ 	COL_MEM,
+ 	COL_WCHAN,
++	COL_SESSION_STATE,
++	COL_RESTART_STYLE,
+ 	COL_PIXBUF,
+ 	COL_POINTER,
+ 	COL_TOOLTIP,
+diff -up gnome-system-monitor-2.23.6/src/util.cpp.session gnome-system-monitor-2.23.6/src/util.cpp
+--- gnome-system-monitor-2.23.6/src/util.cpp.session	2008-07-21 12:18:47.000000000 -0400
++++ gnome-system-monitor-2.23.6/src/util.cpp	2008-08-13 17:23:15.000000000 -0400
+@@ -50,7 +50,81 @@ format_process_state(guint state)
+   return status;
+ }
+ 
++typedef enum {
++        GSM_CLIENT_RESTART_NEVER = 1,
++        GSM_CLIENT_RESTART_IF_RUNNING,
++        GSM_CLIENT_RESTART_ANYWAY,
++        GSM_CLIENT_RESTART_IMMEDIATELY,
++} GsmClientRestartStyle;
+ 
++static const char*
++format_restart_style (guint state)
++{
++  const char *status;
++
++  switch (state)
++    {
++    case GSM_CLIENT_RESTART_IF_RUNNING: 
++      status = NULL;
++      break;
++
++    case GSM_CLIENT_RESTART_ANYWAY: 
++      status = GTK_STOCK_PREFERENCES;
++      break;
++
++    case GSM_CLIENT_RESTART_IMMEDIATELY: 
++      status = GTK_STOCK_REFRESH;
++      break;
++
++    case GSM_CLIENT_RESTART_NEVER:
++      status = GTK_STOCK_DELETE;
++      break;
++
++    default:
++      status = NULL;
++      break;
++    }
++
++  return status;
++}
++
++typedef enum {
++        GSM_CLIENT_UNREGISTERED = 0,
++        GSM_CLIENT_REGISTERED,
++        GSM_CLIENT_FINISHED,
++        GSM_CLIENT_FAILED,
++} GsmClientStatus;
++
++static const char*
++format_session_state (guint state)
++{
++  const char *status;
++
++  switch (state)
++    {
++    case GSM_CLIENT_UNREGISTERED:
++      status = NULL;
++      break;
++
++    case GSM_CLIENT_REGISTERED:
++      status = GTK_STOCK_EXECUTE;
++      break;
++
++    case GSM_CLIENT_FINISHED:
++      status = GTK_STOCK_QUIT;
++      break;
++
++    case GSM_CLIENT_FAILED:
++      status = GTK_STOCK_HELP;
++      break;
++
++    default:
++      status = NULL;
++      break;
++    }
++
++  return status;
++}
+ 
+ static char *
+ mnemonic_safe_process_name(const char *process_name)
+@@ -441,6 +515,58 @@ namespace procman
+     g_object_set(renderer, "text", str, NULL);
+   }
+ 
++  void restart_style_cell_data_func(GtkTreeViewColumn *, GtkCellRenderer *renderer,
++	 		 	    GtkTreeModel *model, GtkTreeIter *iter,
++				    gpointer user_data)
++  {
++    const guint index = GPOINTER_TO_UINT(user_data);
++
++    guint state;
++    GValue value = { 0 };
++
++    gtk_tree_model_get_value(model, iter, index, &value);
++
++    switch (G_VALUE_TYPE(&value)) {
++    case G_TYPE_UINT:
++      state = g_value_get_uint(&value);
++      break;
++
++    default:
++      g_assert_not_reached();
++    }
++
++    g_value_unset(&value);
++
++    const char *str = format_restart_style(state);
++    g_object_set(renderer, "icon-name", str, NULL);
++  }
++
++  void session_state_cell_data_func(GtkTreeViewColumn *, GtkCellRenderer *renderer,
++	 		 	    GtkTreeModel *model, GtkTreeIter *iter,
++				    gpointer user_data)
++  {
++    const guint index = GPOINTER_TO_UINT(user_data);
++
++    guint state;
++    GValue value = { 0 };
++
++    gtk_tree_model_get_value(model, iter, index, &value);
++
++    switch (G_VALUE_TYPE(&value)) {
++    case G_TYPE_UINT:
++      state = g_value_get_uint(&value);
++      break;
++
++    default:
++      g_assert_not_reached();
++    }
++
++    g_value_unset(&value);
++
++    const char *str = format_session_state(state);
++    g_object_set(renderer, "icon-name", str, NULL);
++  }
++
+ 
+   template<>
+   void tree_store_update<const char>(GtkTreeModel* model, GtkTreeIter* iter, int column, const char* new_value)
+diff -up gnome-system-monitor-2.23.6/src/util.h.session gnome-system-monitor-2.23.6/src/util.h
+--- gnome-system-monitor-2.23.6/src/util.h.session	2008-07-21 12:18:47.000000000 -0400
++++ gnome-system-monitor-2.23.6/src/util.h	2008-08-13 17:23:15.000000000 -0400
+@@ -94,6 +94,14 @@ namespace procman
+ 			     GtkTreeModel *model, GtkTreeIter *iter,
+ 			     gpointer user_data);
+ 
++  void session_state_cell_data_func(GtkTreeViewColumn *col, GtkCellRenderer *renderer,
++	 			    GtkTreeModel *model, GtkTreeIter *iter,
++				    gpointer user_data);
++
++  void restart_style_cell_data_func(GtkTreeViewColumn *col, GtkCellRenderer *renderer,
++	 			      GtkTreeModel *model, GtkTreeIter *iter,
++				      gpointer user_data);
++
+   template<typename T>
+   void poison(T &t, char c)
+   {

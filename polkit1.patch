@@ -1,0 +1,751 @@
+diff -u -r gnome-system-monitor-2.26.1/configure.in hacked/configure.in
+--- gnome-system-monitor-2.26.1/configure.in	2009-05-13 22:57:12.774294225 -0400
++++ hacked/configure.in	2009-05-13 22:23:34.635013108 -0400
+@@ -35,8 +35,7 @@
+ GLIBMM_REQUIRED=2.14
+ LIBXML_REQUIRED=2.0
+ RSVG_REQUIRED=2.12
+-POLKIT_GNOME_REQUIRED=0.7
+-POLKIT_DBUS_REQUIRED=0.7
++POLKIT_REQUIRED=0.92
+ DBUS_GLIB_REQUIRED=0.71
+ DBUS_REQUIRED=1.1.2
+ 
+@@ -45,16 +44,14 @@
+ 
+ # PolicyKit detection; defaults to 'auto' (use it if it's available)
+ #
+-POLKIT_GNOME_CFLAGS=
+-POLKIT_GNOME_LIBS=
+-POLKIT_DBUS_CFLAGS=
+-POLKIT_DBUS_LIBS=
++POLKIT_CFLAGS=
++POLKIT_LIBS=
+ AC_ARG_ENABLE(polkit, AS_HELP_STRING([--enable-polkit],[Enable PolicyKit support (auto)]),enable_polkit=$enableval,enable_polkit=auto)
+ if test "x$enable_polkit" = "xno" ; then
+   HAVE_POLKIT=no
+ else
+   HAVE_POLKIT=no
+-  PKG_CHECK_MODULES(POLKIT_GNOME, polkit-gnome >= $POLKIT_GNOME_REQUIRED dbus-1 >= $DBUS_REQUIRED, HAVE_POLKIT=yes, HAVE_POLKIT=no)
++  PKG_CHECK_MODULES(POLKIT, polkit-gobject-1 >= $POLKIT_REQUIRED dbus-1 >= $DBUS_REQUIRED dbus-glib-1 >= $DBUS_GLIB_REQUIRED gobject-2.0, HAVE_POLKIT=yes, HAVE_POLKIT=no)
+ 
+   if test "x$enable_polkit" = "xyes" -a "x$HAVE_POLKIT" = "xno" ; then
+     AC_MSG_ERROR(PolicyKit support explicity enabled but not available)
+@@ -62,14 +59,11 @@
+  
+   if test "x$HAVE_POLKIT" = "xyes" ; then
+     AC_DEFINE(HAVE_POLKIT, 1, [Defined if PolicyKit support is enabled])
+-    PKG_CHECK_MODULES(POLKIT_DBUS, polkit-dbus >= $POLKIT_DBUS_REQUIRED dbus-glib-1 >= $DBUS_GLIB_REQUIRED gobject-2.0)
+   fi
+ fi
+ AM_CONDITIONAL(HAVE_POLKIT, test "x$HAVE_POLKIT" = "xyes")
+-AC_SUBST(POLKIT_GNOME_CFLAGS)
+-AC_SUBST(POLKIT_GNOME_LIBS)
+-AC_SUBST(POLKIT_DBUS_CFLAGS)
+-AC_SUBST(POLKIT_DBUS_LIBS)
++AC_SUBST(POLKIT_CFLAGS)
++AC_SUBST(POLKIT_LIBS)
+ 
+ AC_ARG_ENABLE(more-warnings,
+ [AC_HELP_STRING([--enable-more-warnings], [Maximum compiler warnings])],
+diff -u -r gnome-system-monitor-2.26.1/src/callbacks.cpp hacked/src/callbacks.cpp
+--- gnome-system-monitor-2.26.1/src/callbacks.cpp	2009-05-13 22:57:12.776261325 -0400
++++ hacked/src/callbacks.cpp	2009-05-13 22:23:34.636012198 -0400
+@@ -210,13 +210,11 @@
+ 
+ 
+ 
+-#ifndef HAVE_POLKIT
+ void
+ cb_end_process_button_pressed (GtkButton *button, gpointer data)
+ {
+ 	kill_process_helper(static_cast<ProcData*>(data), SIGTERM);
+ }
+-#endif
+ 
+ 
+ static void change_gconf_color(GConfClient *client, const char *key,
+@@ -288,7 +286,6 @@
+ 	ProcData * const procdata = static_cast<ProcData*>(data);
+ 
+ 	procdata->selection = selection;
+-	procdata->selected_process = NULL;
+ 
+ 	/* get the most recent selected process and determine if there are
+ 	** no selected processes
+diff -u -r gnome-system-monitor-2.26.1/src/gnome-system-monitor-mechanism.c hacked/src/gnome-system-monitor-mechanism.c
+--- gnome-system-monitor-2.26.1/src/gnome-system-monitor-mechanism.c	2009-05-13 22:57:12.777261253 -0400
++++ hacked/src/gnome-system-monitor-mechanism.c	2009-05-13 22:30:21.357048484 -0400
+@@ -40,7 +40,7 @@
+ #include <glib-object.h>
+ #include <dbus/dbus-glib.h>
+ #include <dbus/dbus-glib-lowlevel.h>
+-#include <polkit-dbus/polkit-dbus.h>
++#include <polkit/polkit.h>
+ 
+ static gboolean no_exit = FALSE;
+ 
+@@ -124,7 +124,7 @@
+ {
+         DBusGConnection *system_bus_connection;
+         DBusGProxy      *system_bus_proxy;
+-        PolKitContext   *pol_ctx;
++        PolkitAuthority *pol_ctx;
+ };
+ 
+ static void     gnome_system_monitor_mechanism_class_init  (GnomeSystemMonitorMechanismClass *klass);
+@@ -232,50 +232,11 @@
+ }
+ 
+ static gboolean
+-pk_io_watch_have_data (GIOChannel *channel, GIOCondition condition, gpointer user_data)
+-{
+-        int fd;
+-        PolKitContext *pk_context = user_data;
+-        fd = g_io_channel_unix_get_fd (channel);
+-        polkit_context_io_func (pk_context, fd);
+-        return TRUE;
+-}
+-
+-static int 
+-pk_io_add_watch (PolKitContext *pk_context, int fd)
+-{
+-        guint id = 0;
+-        GIOChannel *channel;
+-        channel = g_io_channel_unix_new (fd);
+-        if (channel == NULL)
+-                goto out;
+-        id = g_io_add_watch (channel, G_IO_IN, pk_io_watch_have_data, pk_context);
+-        if (id == 0) {
+-                g_io_channel_unref (channel);
+-                goto out;
+-        }
+-        g_io_channel_unref (channel);
+-out:
+-        return id;
+-}
+-
+-static void 
+-pk_io_remove_watch (PolKitContext *pk_context, int watch_id)
+-{
+-        g_source_remove (watch_id);
+-}
+-
+-static gboolean
+ register_mechanism (GnomeSystemMonitorMechanism *mechanism)
+ {
+         GError *error = NULL;
+ 
+-        mechanism->priv->pol_ctx = polkit_context_new ();
+-        polkit_context_set_io_watch_functions (mechanism->priv->pol_ctx, pk_io_add_watch, pk_io_remove_watch);
+-        if (!polkit_context_init (mechanism->priv->pol_ctx, NULL)) {
+-                g_critical ("cannot initialize libpolkit");
+-                goto error;
+-        }
++        mechanism->priv->pol_ctx = polkit_authority_get ();
+ 
+         error = NULL;
+         mechanism->priv->system_bus_connection = dbus_g_bus_get (DBUS_BUS_SYSTEM, &error);
+@@ -321,93 +282,66 @@
+         return GNOME_SYSTEM_MONITOR_MECHANISM (object);
+ }
+ 
+-static PolKitCaller *
++static PolkitSubject *
+ get_caller_from_context (GnomeSystemMonitorMechanism *mechanism, DBusGMethodInvocation *context)
+ {
+-        const char *sender;
+-        GError *error;
+-        DBusError dbus_error;
+-        PolKitCaller *pk_caller;
++        char *sender;
++        PolkitSubject *pk_caller;
+ 
+         sender = dbus_g_method_get_sender (context);
+-        dbus_error_init (&dbus_error);
+-        pk_caller = polkit_caller_new_from_dbus_name (
+-                dbus_g_connection_get_connection (mechanism->priv->system_bus_connection),
+-                sender, 
+-                &dbus_error);
+-        if (pk_caller == NULL) {
+-                error = g_error_new (GNOME_SYSTEM_MONITOR_MECHANISM_ERROR,
+-                                     GNOME_SYSTEM_MONITOR_MECHANISM_ERROR_GENERAL,
+-                                     "Error getting information about caller: %s: %s",
+-                                     dbus_error.name, dbus_error.message);
+-                dbus_error_free (&dbus_error);
+-                dbus_g_method_return_error (context, error);
+-                g_error_free (error);
+-                return NULL;
+-        }
++        pk_caller = polkit_system_bus_name_new (sender);
++	g_free (sender);
+ 
+         return pk_caller;
+ }
+ 
+-/* note, we take ownership of the passed PolKitCaller object */
++/* note, we take ownership of the passed PolkitSubject object */
+ static gboolean
+-_check_polkit_for_action_for_caller (GnomeSystemMonitorMechanism *mechanism, 
++_check_polkit_for_action_for_caller (GnomeSystemMonitorMechanism *mechanism,
+                                      DBusGMethodInvocation *context,
+-                                     PolKitCaller *pk_caller, 
+-                                     const char *action,
+-                                     const char *action_secondary)
++                                     PolkitSubject *subject,
++                                     const char *action)
+ {
+         GError *error;
+-        PolKitAction *pk_action;
+-        PolKitResult pk_result;
++        PolkitAuthorizationResult *result;
+ 
+         error = NULL;
+ 
+-        pk_action = polkit_action_new ();
+-        polkit_action_set_action_id (pk_action, action);
+-        pk_result = polkit_context_is_caller_authorized (mechanism->priv->pol_ctx, 
+-                                                         pk_action, 
+-                                                         pk_caller, 
+-                                                         TRUE, 
+-                                                         NULL);
+-        if (pk_result != POLKIT_RESULT_YES) {
+-                polkit_action_set_action_id (pk_action, action_secondary);
+-                pk_result = polkit_context_is_caller_authorized (mechanism->priv->pol_ctx, 
+-                                                                 pk_action, 
+-                                                                 pk_caller, 
+-                                                                 TRUE, 
+-                                                                 NULL);
+-        }
+-        polkit_action_unref (pk_action);
+-        polkit_caller_unref (pk_caller);
++        result = polkit_authority_check_authorization_sync (mechanism->priv->pol_ctx,
++                                                            subject,
++                                                            action,
++                                                            NULL,
++                                                            POLKIT_CHECK_AUTHORIZATION_FLAGS_ALLOW_USER_INTERACTION,
++                                                            NULL, NULL);
++        g_object_unref (subject);
+ 
+-        if (pk_result != POLKIT_RESULT_YES) {
++        if (!polkit_authorization_result_get_is_authorized (result)) {
+                 error = g_error_new (GNOME_SYSTEM_MONITOR_MECHANISM_ERROR,
+                                      GNOME_SYSTEM_MONITOR_MECHANISM_ERROR_NOT_PRIVILEGED,
+-                                     "%s %s <-- (action, result)",
+-                                     action,
+-                                     polkit_result_to_string_representation (pk_result));
++                                     "%s",
++                                     action);
+                 dbus_g_method_return_error (context, error);
+                 g_error_free (error);
++		g_object_unref (result);
+                 return FALSE;
+         }
+ 
++	g_object_unref (result);
+         return TRUE;
+ }
+ 
+ static gboolean
+-_check_polkit_for_action (GnomeSystemMonitorMechanism *mechanism, 
+-                          DBusGMethodInvocation *context, 
+-                          const char *action,
+-                          const char *action_secondary)
++_check_polkit_for_action (GnomeSystemMonitorMechanism *mechanism,
++                          DBusGMethodInvocation *context,
++                          const char *action)
+ {
+-        PolKitCaller *pk_caller;
++        PolkitSubject *subject;
+ 
+         /* Check that caller is privileged */
+-        if ((pk_caller = get_caller_from_context (mechanism, context)) == NULL)
++        if ((subject = get_caller_from_context (mechanism, context)) == NULL)
+                 return FALSE;
+ 
+-        return _check_polkit_for_action_for_caller (mechanism, context, pk_caller, action, action_secondary);
++        return _check_polkit_for_action_for_caller (mechanism, context, subject, action);
+ }
+ 
+ /*--------------------------------------------------------------------------------------------------------------*/
+@@ -421,7 +355,7 @@
+ {
+         reset_killtimer ();
+ 
+-        if (!_check_polkit_for_action (mechanism, context, "org.gnome.system-monitor.kill", NULL))
++        if (!_check_polkit_for_action (mechanism, context, "org.gnome.system-monitor.kill"))
+                 return FALSE;
+ 
+         g_debug ("Sending signal %d to pid %d", sig, pid);
+@@ -441,6 +375,28 @@
+         return TRUE;
+ }
+ 
++static gboolean
++get_uid_from_context (GnomeSystemMonitorMechanism  *mechanism,
++                      DBusGMethodInvocation        *context,
++                      uid_t                        *uid)
++{
++        char *sender;
++        DBusConnection *con;
++
++        con = dbus_g_connection_get_connection (dbus_g_bus_get (DBUS_BUS_SYSTEM, NULL));
++        if (con == NULL)
++                return FALSE;
++
++        sender = dbus_g_method_get_sender (context);
++	*uid = dbus_bus_get_unix_user (con, sender, NULL);
++        g_free (sender);
++
++        if (*uid == (unsigned)-1)
++                return FALSE;
++
++        return TRUE;
++}
++
+ gboolean
+ gnome_system_monitor_mechanism_renice (GnomeSystemMonitorMechanism  *mechanism,
+                                        int                           pid,
+@@ -449,11 +405,10 @@
+ {
+         uid_t caller_uid;
+         uid_t process_uid;
+-        PolKitCaller *pk_caller;
++        PolkitSubject *subject;
+         char *procpath;
+         struct stat statbuf;
+         const char *action_id;
+-        const char *action_id_secondary;
+ 
+         reset_killtimer ();
+ 
+@@ -473,11 +428,11 @@
+         g_free (procpath);
+         process_uid = statbuf.st_uid;
+ 
+-        pk_caller = get_caller_from_context (mechanism, context);
+-        if (pk_caller == NULL)
++        subject = get_caller_from_context (mechanism, context);
++        if (subject == NULL)
+                 return FALSE;
+ 
+-        if (!polkit_caller_get_uid (pk_caller, &caller_uid)) {
++        if (!get_uid_from_context (mechanism, context, &caller_uid)) {
+                 GError *error;
+                 error = g_error_new (GNOME_SYSTEM_MONITOR_MECHANISM_ERROR,
+                                      GNOME_SYSTEM_MONITOR_MECHANISM_ERROR_GENERAL,
+@@ -485,24 +440,21 @@
+                 g_warning ("Error: %s", error->message);
+                 dbus_g_method_return_error (context, error);
+                 g_error_free (error);
+-                polkit_caller_unref (pk_caller);
++                g_object_unref (subject);
+                 return FALSE;
+         }
+ 
+         if (caller_uid == process_uid) {
+-                /* we need either .increase-own-priority or .change-priority */
+                 action_id = "org.gnome.system-monitor.increase-own-priority";
+-                action_id_secondary = "org.gnome.system-monitor.change-priority";
+         } else {
+                 action_id = "org.gnome.system-monitor.change-priority";
+-                action_id_secondary = NULL;
+         }
+ 
+-        if (!_check_polkit_for_action_for_caller (mechanism, context, pk_caller, action_id, action_id_secondary)) {
++        if (!_check_polkit_for_action_for_caller (mechanism, context, subject, action_id)) {
+                 return FALSE;
+         }
+ 
+-        g_debug ("Renicing pid %d (owned by uid %d) to priority %d on behalf of uid %d (action_id=%s)", 
++        g_debug ("Renicing pid %d (owned by uid %d) to priority %d on behalf of uid %d (action_id=%s)",
+                  pid, process_uid, nice_value, caller_uid, action_id);
+ 
+         errno = 0;
+diff -u -r gnome-system-monitor-2.26.1/src/interface.cpp hacked/src/interface.cpp
+--- gnome-system-monitor-2.26.1/src/interface.cpp	2009-05-13 22:57:12.780261944 -0400
++++ hacked/src/interface.cpp	2009-05-13 22:23:34.638019736 -0400
+@@ -31,7 +31,7 @@
+ #include <math.h>
+ 
+ #ifdef HAVE_POLKIT
+-#  include <polkit-gnome/polkit-gnome.h>
++#  include <polkit/polkit.h>
+ #endif
+ 
+ #include "procman.h"
+@@ -193,7 +193,9 @@
+ 	gtk_box_pack_start (GTK_BOX (vbox1), hbox2, FALSE, FALSE, 0);
+ 	
+ #ifdef HAVE_POLKIT
+-	procdata->endprocessbutton = polkit_gnome_action_create_button (procdata->sigterm_action);
++	procdata->endprocessbutton = gtk_button_new ();
++	gtk_activatable_set_related_action (GTK_ACTIVATABLE (procdata->endprocessbutton),
++                                            procdata->sigterm_action);
+ #else
+ 	procdata->endprocessbutton = gtk_button_new_with_mnemonic (_("End _Process"));
+ 	g_signal_connect (G_OBJECT (procdata->endprocessbutton), "clicked",
+@@ -681,39 +683,35 @@
+ 					    procdata);
+ 
+ #ifdef HAVE_POLKIT
+-        procdata->sigstop_action = polkit_gnome_action_new_default ("StopProcess", 
+-                                                                    NULL, 
+-                                                                    _("_Stop Process"), 
+-                                                                    _("Stop process"));
+-        g_object_set (procdata->sigstop_action, "auth-label", _("_Stop Process..."), NULL);
++        procdata->sigstop_action = gtk_action_new ("StopProcess",
++                                                   _("_Stop Process"),
++                                                   _("Stop process"),
++                                                   NULL);
+         g_signal_connect (procdata->sigstop_action, "activate", G_CALLBACK (cb_kill_sigstop), procdata);
+         gtk_action_group_add_action_with_accel (procdata->action_group, 
+                                                 GTK_ACTION (procdata->sigstop_action), 
+                                                 "<control>S");
+ 
+-        procdata->sigcont_action = polkit_gnome_action_new_default ("ContProcess", 
+-                                                                    NULL, 
+-                                                                    _("_Continue Process"), 
+-                                                                    _("Continue process"));
+-        g_object_set (procdata->sigcont_action, "auth-label", _("_Continue Process..."), NULL);
++        procdata->sigcont_action = gtk_action_new ("ContProcess",
++                                                   _("_Continue Process"), 
++                                                   _("Continue process"),
++                                                   NULL);
+         g_signal_connect (procdata->sigcont_action, "activate", G_CALLBACK (cb_kill_sigcont), procdata);
+         gtk_action_group_add_action_with_accel (procdata->action_group, GTK_ACTION (procdata->sigcont_action), 
+                                                 "<control>C");
+ 
+-        procdata->sigterm_action = polkit_gnome_action_new_default ("EndProcess", 
+-                                                                    NULL, 
+-                                                                    _("End _Process"), 
+-                                                                    _("Force process to finish normally"));
+-        g_object_set (procdata->sigterm_action, "auth-label", _("End _Process..."), NULL);
++        procdata->sigterm_action = gtk_action_new ("EndProcess",
++                                                   _("End _Process"),
++                                                   _("Force process to finish normally"),
++                                                   NULL);
+         g_signal_connect (procdata->sigterm_action, "activate", G_CALLBACK (cb_end_process), procdata);
+         gtk_action_group_add_action_with_accel (procdata->action_group, GTK_ACTION (procdata->sigterm_action), 
+                                                 "<control>E");
+ 
+-        procdata->sigkill_action = polkit_gnome_action_new_default ("KillProcess", 
+-                                                                    NULL, 
+-                                                                    _("_Kill Process"), 
+-                                                                    _("Force process to finish immediately"));
+-        g_object_set (procdata->sigkill_action, "auth-label", _("_Kill Process..."), NULL);
++        procdata->sigkill_action = gtk_action_new ("KillProcess",
++                                                   _("_Kill Process"),
++                                                   _("Force process to finish immediately"),
++                                                   NULL);
+         g_signal_connect (procdata->sigkill_action, "activate", G_CALLBACK (cb_kill_process), procdata);
+         gtk_action_group_add_action_with_accel (procdata->action_group, GTK_ACTION (procdata->sigkill_action), 
+                                                 "<control>K");
+@@ -839,36 +837,9 @@
+ 	for (i = 0; i != G_N_ELEMENTS(selected_actions); ++i) {
+ 		action = gtk_action_group_get_action(data->action_group,
+ 						     selected_actions[i]);
+-#ifdef HAVE_POLKIT
+-                if (POLKIT_GNOME_IS_ACTION (action)) {
+-                        polkit_gnome_action_set_sensitive (POLKIT_GNOME_ACTION (action), selected_sensitivity);
+-                } else {
+-                        gtk_action_set_sensitive(action, selected_sensitivity);
+-                }
+-#else
+-		gtk_action_set_sensitive(action, selected_sensitivity);
+-#endif
++		gtk_action_set_sensitive(action, processes_sensitivity);
+ 	}
+ 
+-#ifdef HAVE_POLKIT
+-        /* update the PolicyKit actions */
+-        if (data->selected_process != NULL) {
+-                ProcInfo *pi = data->selected_process;
+-                PolKitAction *pk_action;
+-
+-                /* TODO: multiple processes may be selected; consider all of them */
+-
+-                if (pi->uid == getuid ()) {
+-                        pk_action = NULL;
+-                } else {
+-                        pk_action = data->pk_action_kill;
+-                }
+-                g_object_set (data->sigstop_action, "polkit-action", pk_action, NULL);
+-                g_object_set (data->sigcont_action, "polkit-action", pk_action, NULL);
+-                g_object_set (data->sigterm_action, "polkit-action", pk_action, NULL);
+-                g_object_set (data->sigkill_action, "polkit-action", pk_action, NULL);
+-        }
+-#endif
+ }
+ 
+ static void		
+diff -u -r gnome-system-monitor-2.26.1/src/Makefile.am hacked/src/Makefile.am
+--- gnome-system-monitor-2.26.1/src/Makefile.am	2009-05-13 22:57:12.807264047 -0400
++++ hacked/src/Makefile.am	2009-05-13 22:23:34.639041036 -0400
+@@ -5,8 +5,8 @@
+ 	-DGNOMELOCALEDIR=\""$(datadir)/locale"\" \
+ 	-DDATADIR=\""$(datadir)"\" \
+ 	@PROCMAN_CFLAGS@ \
+-	@POLKIT_DBUS_CFLAGS@ \
+-	@POLKIT_GNOME_CFLAGS@
++	@POLKIT_CFLAGS@ \
++	@POLKIT_CFLAGS@
+ 
+ bin_PROGRAMS = gnome-system-monitor
+ 
+@@ -42,7 +42,7 @@
+ gnome_system_monitor_SOURCES += gnome-system-monitor-mechanism-client-glue.h
+ endif
+ 
+-gnome_system_monitor_LDADD = @PROCMAN_LIBS@ @POLKIT_GNOME_LIBS@ libbacon.la
++gnome_system_monitor_LDADD = @PROCMAN_LIBS@ @POLKIT_LIBS@ libbacon.la
+ 
+ 
+ noinst_LTLIBRARIES = libbacon.la
+@@ -61,7 +61,7 @@
+ ######################################################################
+ if HAVE_POLKIT
+ 
+-polkit_policydir = $(datadir)/PolicyKit/policy
++polkit_policydir = $(datadir)/polkit-1/actions
+ dist_polkit_policy_DATA = org.gnome.system-monitor.policy
+ # You will need a recent intltool or the patch from this bug http://bugzilla.gnome.org/show_bug.cgi?id=462312
+ @INTLTOOL_POLICY_RULE@
+@@ -86,8 +86,8 @@
+ 						gnome-system-monitor-mechanism-glue.h \
+ 	gnome-system-monitor-mechanism.c
+ 
+-gnome_system_monitor_mechanism_CFLAGS = $(POLKIT_DBUS_CFLAGS)
+-gnome_system_monitor_mechanism_LDADD = $(POLKIT_DBUS_LIBS)
++gnome_system_monitor_mechanism_CFLAGS = $(POLKIT_CFLAGS)
++gnome_system_monitor_mechanism_LDADD = $(POLKIT_LIBS)
+ endif
+ ######################################################################
+ 
+diff -u -r gnome-system-monitor-2.26.1/src/org.gnome.SystemMonitor.Mechanism.conf hacked/src/org.gnome.SystemMonitor.Mechanism.conf
+--- gnome-system-monitor-2.26.1/src/org.gnome.SystemMonitor.Mechanism.conf	2009-05-13 22:57:12.782262429 -0400
++++ hacked/src/org.gnome.SystemMonitor.Mechanism.conf	2009-05-13 22:53:53.916316134 -0400
+@@ -8,4 +8,8 @@
+   <policy user="root">
+     <allow own="org.gnome.SystemMonitor.Mechanism"/>
+   </policy>
++
++  <policy context="default">
++    <allow send_destination="org.gnome.SystemMonitor.Mechanism"/>
++  </policy>
+ </busconfig>
+diff -u -r gnome-system-monitor-2.26.1/src/org.gnome.system-monitor.policy.in hacked/src/org.gnome.system-monitor.policy.in
+--- gnome-system-monitor-2.26.1/src/org.gnome.system-monitor.policy.in	2009-05-13 22:57:12.784261935 -0400
++++ hacked/src/org.gnome.system-monitor.policy.in	2009-05-13 22:23:34.640011979 -0400
+@@ -34,7 +34,7 @@
+     <_message>Increasing the priority of one of your own processes requires privileges</_message>
+     <defaults>
+       <allow_inactive>no</allow_inactive>
+-      <allow_active>auth_self_keep_always</allow_active>
++      <allow_active>auth_self_keep</allow_active>
+     </defaults>
+   </action>
+ 
+diff -u -r gnome-system-monitor-2.26.1/src/procactions.cpp hacked/src/procactions.cpp
+--- gnome-system-monitor-2.26.1/src/procactions.cpp	2009-05-13 22:57:12.785264168 -0400
++++ hacked/src/procactions.cpp	2009-05-13 22:23:34.640011979 -0400
+@@ -33,7 +33,7 @@
+ 
+ #ifdef HAVE_POLKIT
+ #  include "gnome-system-monitor-mechanism-client-glue.h"
+-#  include <polkit-gnome/polkit-gnome.h>
++#  include <polkit/polkit.h>
+ #endif
+ 
+ static void
+diff -u -r gnome-system-monitor-2.26.1/src/procdialogs.cpp hacked/src/procdialogs.cpp
+--- gnome-system-monitor-2.26.1/src/procdialogs.cpp	2009-05-13 22:57:12.787262906 -0400
++++ hacked/src/procdialogs.cpp	2009-05-13 22:23:34.641019659 -0400
+@@ -35,11 +35,6 @@
+ #include "procman_gnomesu.h"
+ #include "procman_gksu.h"
+ 
+-#ifdef HAVE_POLKIT
+-#  include "gnome-system-monitor-mechanism-client-glue.h"
+-#  include <polkit-gnome/polkit-gnome.h>
+-#endif
+-
+ static GtkWidget *renice_dialog = NULL;
+ static GtkWidget *prefs_dialog = NULL;
+ static gint new_nice_value = 0;
+@@ -129,56 +124,8 @@
+ typedef struct {
+         GtkWidget *priority_label;
+         ProcData *procdata;
+-#ifdef HAVE_POLKIT
+-        PolKitGnomeAction *renice_action;
+-#endif
+ } ReniceClosure;
+ 
+-#ifdef HAVE_POLKIT
+-static void
+-_renice_compute_polkit_action (ReniceClosure *rc)
+-{
+-        if (rc->procdata->selected_process != NULL) {
+-                ProcInfo *pi = rc->procdata->selected_process;
+-
+-                if (pi->uid == getuid ()) {
+-                        if (new_nice_value < pi->nice) {
+-                                GValue v;
+-                                GValueArray *va;
+-
+-                                g_warning ("foo");
+-
+-                                memset (&v, 0, sizeof (GValue));
+-                                g_value_init (&v, G_TYPE_POINTER);
+-                                g_value_set_pointer (&v, rc->procdata->pk_action_change_priority);
+-                                va = g_value_array_new (1);
+-                                g_value_array_prepend (va, &v);
+-
+-                                g_object_set (rc->renice_action, 
+-                                              "polkit-action", 
+-                                              rc->procdata->pk_action_increase_own_priority,
+-                                              "polkit-action-sufficient", 
+-                                              va,
+-                                              NULL);
+-
+-                                g_value_array_free (va);
+-                                goto out;
+-                        } 
+-                } else {
+-                        g_object_set (rc->renice_action, 
+-                                      "polkit-action", 
+-                                      rc->procdata->pk_action_change_priority, NULL);
+-                        goto out;
+-                }
+-        }
+-
+-        g_object_set (rc->renice_action, "polkit-action", NULL, NULL);
+-
+-out:
+-        ;
+-}
+-#endif
+-
+ static void
+ renice_scale_changed (GtkAdjustment *adj, gpointer data)
+ {
+@@ -186,9 +133,6 @@
+ 
+ 	new_nice_value = int(adj->value);
+ 	gtk_label_set_text (GTK_LABEL (rc->priority_label), get_nice_level (new_nice_value));		
+-#ifdef HAVE_POLKIT
+-        _renice_compute_polkit_action (rc);
+-#endif
+ }
+ 
+ static void
+@@ -204,10 +148,6 @@
+ 	
+ 	gtk_widget_destroy (GTK_WIDGET (dialog));
+ 	renice_dialog = NULL;
+-
+-#ifdef HAVE_POLKIT
+-        g_object_unref (G_OBJECT (rc->renice_action));
+-#endif
+         g_free (rc);
+ }
+ 
+@@ -224,11 +164,9 @@
+   	GtkObject *renice_adj;
+   	GtkWidget *hscale;
+ 	GtkWidget *button;
+-#ifndef HAVE_POLKIT
+-	GtkWidget *hbox;
+ 	GtkWidget *align;
++	GtkWidget *hbox;
+ 	GtkWidget *icon;
+-#endif
+   	gchar *text;
+         ReniceClosure *rc;
+ 
+@@ -250,19 +188,6 @@
+ 	gtk_dialog_set_has_separator (GTK_DIALOG (renice_dialog), FALSE);
+ 	gtk_container_set_border_width (GTK_CONTAINER (renice_dialog), 5);
+ 
+-#ifdef HAVE_POLKIT
+-        rc->renice_action = polkit_gnome_action_new_default ("ReniceProcessButton", 
+-                                                             NULL,
+-                                                             _("Change _Priority"),
+-                                                             NULL);
+-        g_object_set (rc->renice_action, 
+-                      "auth-label", _("Change _Priority..."), 
+-                      "yes-icon-name", GTK_STOCK_OK, 
+-                      NULL);
+-
+-        button = polkit_gnome_action_create_button (rc->renice_action);
+-	GTK_WIDGET_SET_FLAGS (button, GTK_CAN_DEFAULT);
+-#else  	
+ 	button = gtk_button_new ();
+ 	GTK_WIDGET_SET_FLAGS (button, GTK_CAN_DEFAULT);
+ 		
+@@ -279,7 +204,6 @@
+ 	gtk_label_set_mnemonic_widget (GTK_LABEL (label), button);
+ 	gtk_box_pack_end (GTK_BOX (hbox), label, FALSE, FALSE, 0);
+ 
+-#endif
+ 	gtk_dialog_add_action_widget (GTK_DIALOG (renice_dialog), button, 100);
+ 
+   	gtk_dialog_set_default_response (GTK_DIALOG (renice_dialog), 100);
+@@ -325,7 +249,6 @@
+ 
+         rc->priority_label = priority_label;
+         new_nice_value = info->nice;
+-        _renice_compute_polkit_action (rc);
+ 	
+ 	g_signal_connect (G_OBJECT (dialog), "response",
+   			  G_CALLBACK (renice_dialog_button_pressed), rc);
+diff -u -r gnome-system-monitor-2.26.1/src/procman.cpp hacked/src/procman.cpp
+--- gnome-system-monitor-2.26.1/src/procman.cpp	2009-05-13 22:57:12.790293839 -0400
++++ hacked/src/procman.cpp	2009-05-13 22:23:34.642011835 -0400
+@@ -79,15 +79,6 @@
+                                                                    "/",
+                                                                    "org.gnome.SystemMonitor.Mechanism");
+         }
+-
+-        this->pk_action_kill = polkit_action_new ();
+-        polkit_action_set_action_id (this->pk_action_kill, "org.gnome.system-monitor.kill");
+-
+-        this->pk_action_change_priority = polkit_action_new ();
+-        polkit_action_set_action_id (this->pk_action_change_priority, "org.gnome.system-monitor.change-priority");
+-
+-        this->pk_action_increase_own_priority = polkit_action_new ();
+-        polkit_action_set_action_id (this->pk_action_increase_own_priority, "org.gnome.system-monitor.increase-own-priority");
+ #endif
+ }
+ 
+diff -u -r gnome-system-monitor-2.26.1/src/procman.h hacked/src/procman.h
+--- gnome-system-monitor-2.26.1/src/procman.h	2009-05-13 22:57:12.791293418 -0400
++++ hacked/src/procman.h	2009-05-13 22:23:34.643012042 -0400
+@@ -35,7 +35,6 @@
+ 
+ #ifdef HAVE_POLKIT
+ #  include <dbus/dbus-glib.h>
+-#  include <polkit-gnome/polkit-gnome.h>
+ #endif
+ 
+ struct ProcInfo;
+@@ -219,14 +218,10 @@
+ #ifdef HAVE_POLKIT
+         DBusGProxy *mechanism_proxy;
+ 
+-        PolKitAction *pk_action_kill;
+-        PolKitAction *pk_action_change_priority;
+-        PolKitAction *pk_action_increase_own_priority;
+-
+-        PolKitGnomeAction *sigstop_action;
+-        PolKitGnomeAction *sigcont_action;
+-        PolKitGnomeAction *sigterm_action;
+-        PolKitGnomeAction *sigkill_action;
++        GtkAction *sigstop_action;
++        GtkAction *sigcont_action;
++        GtkAction *sigterm_action;
++        GtkAction *sigkill_action;
+ #endif
+ 
+ 	unsigned	frequency;
